@@ -67,3 +67,13 @@ flatbuild
 /.edge-zentao-profile
 /resources/web/chat/node_modules/
 /tools/updater/*.syso
+
+# Agent/IDE state that upstream committed but that must not follow the fork.
+# .claude/settings.json is read by Claude Code as project settings, so pulling
+# theirs in would silently pre-approve their shell commands in our checkout.
+/.claude/
+
+# Local packaging output and unpacked AppImages
+/*.AppImage
+/*.AppImage.orig
+/squashfs-root/

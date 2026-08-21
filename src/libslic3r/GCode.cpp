@@ -6826,31 +6826,35 @@ int GCode::get_bed_temperature(const int extruder_id, const bool is_first_layer,
 {
     std::string bed_temp_key = is_first_layer ? get_bed_temp_1st_layer_key(bed_type) : get_bed_temp_key(bed_type);
     const ConfigOptionInts* bed_temp_opt = m_config.option<ConfigOptionInts>(bed_temp_key);
+
+    // BBS: collect the filaments that actually print. Both modes have to ignore idle
+    // slots, otherwise a filament that is only loaded drives the bed temperature.
+    std::vector<unsigned int> printing_ids;
+    if (extruder_ids != nullptr && !extruder_ids->empty())
+        printing_ids = *extruder_ids;
+    else
+        for (const Extruder& extruder : m_writer.extruders())
+            printing_ids.push_back(extruder.id());
+    printing_ids.erase(std::remove_if(printing_ids.begin(), printing_ids.end(),
+                                      [bed_temp_opt](unsigned int idx) { return idx >= bed_temp_opt->size(); }),
+                       printing_ids.end());
+
     if (m_config.bed_temperature_mode.value == BedTemperatureMode::UseMaxTemperature) {
         int max_temp = 0;
-        bool has_printing_temp = false;
-        auto collect_temp = [&](unsigned int idx) {
-            if (idx < bed_temp_opt->size()) {
-                max_temp = std::max(max_temp, bed_temp_opt->get_at(int(idx)));
-                has_printing_temp = true;
-            }
-        };
-
-        if (extruder_ids != nullptr && !extruder_ids->empty()) {
-            for (unsigned int idx : *extruder_ids)
-                collect_temp(idx);
-        } else if (!m_writer.extruders().empty()) {
-            for (const Extruder& extruder : m_writer.extruders())
-                collect_temp(extruder.id());
-        }
-
-        if (!has_printing_temp)
+        if (printing_ids.empty()) {
             for (size_t idx = 0; idx < bed_temp_opt->size(); ++idx)
-                collect_temp((unsigned int)idx);
-
+                max_temp = std::max(max_temp, bed_temp_opt->get_at(int(idx)));
+        } else {
+            for (unsigned int idx : printing_ids)
+                max_temp = std::max(max_temp, bed_temp_opt->get_at(int(idx)));
+        }
         return max_temp;
     }
-    constexpr int first_material_extruder_id = 0;
+
+    // Use the first filament of the print, not slot 1 which may sit idle. Deriving it from the
+    // whole print instead of the current layer keeps the value stable across layers.
+    int first_material_extruder_id = printing_ids.empty() ?
+        0 : int(*std::min_element(printing_ids.begin(), printing_ids.end()));
     return bed_temp_opt->get_at(first_material_extruder_id);
 }
 

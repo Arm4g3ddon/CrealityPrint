@@ -1,6 +1,46 @@
 # Creality Print 6.0  
 Creality Print 6.0 is an open source slicer for FDM printers.   [Offical Wiki](https://wiki.creality.com/en/software) 
 
+---
+
+## About this fork
+
+This is a Linux-focused fork of [CrealityOfficial/CrealityPrint](https://github.com/CrealityOfficial/CrealityPrint).
+Upstream builds and ships Windows and macOS only — its CI has no Linux target — so Linux
+build breakage and Linux-only runtime crashes tend to go unnoticed there. This fork rebases
+onto upstream releases, carries the fixes needed to build and run on Linux, and publishes
+AppImages under [Releases](https://github.com/Arm4g3ddon/CrealityPrint/releases).
+
+### Fixes originating here
+
+| Date | Fix | Upstream |
+|---|---|---|
+| 2026-06-02 | Read-only parameter inputs after a mode toggle | adopted |
+| 2026-06-02 | Docker build migrated to Ubuntu 24.04 / GCC 13 | adopted |
+| 2026-06-04 | Link error: `libLerc` missing from the static link line | adopted |
+| 2026-06-04 | Startup crash from a case-mismatched Kingroon profile reference | adopted |
+| 2026-06-04 | Settings inputs read-only on GTK ([#565](https://github.com/CrealityOfficial/CrealityPrint/issues/565), [#552](https://github.com/CrealityOfficial/CrealityPrint/issues/552)) | adopted |
+| 2026-07-03 | Build errors in the 7.2.0 sources (GCC vs MSVC) | adopted |
+| 2026-07-03 | Translations built and bundled into the Linux package | carried here |
+| 2026-07-03 | Segfault on exit — dead GL context in global destructors | carried here |
+| 2026-07-03 | Breakpad `dumpCallback` made exception-safe | carried here |
+
+"adopted" means the change is present in upstream `release-260731`, verified line by line
+against this tree. Both pull requests that offered these fixes upstream —
+[#572](https://github.com/CrealityOfficial/CrealityPrint/pull/572) (June 4) and
+[#577](https://github.com/CrealityOfficial/CrealityPrint/pull/577) (July 3) — are still open.
+
+The three fixes marked "carried here" are the ones upstream cannot observe: they only show
+up when the application is actually built and run on Linux.
+
+### Building
+
+Requires wxWidgets 3.3.2; an older `deps/build` fails at configure time. See
+[BuildLinux.sh](BuildLinux.sh). Linux-specific issues belong in this repository's
+issue tracker — anything else upstream.
+
+---
+
 # Join community
 
 <a href="https://discord.gg/agTqDNyJNY"><img src="https://img.shields.io/static/v1?message=Discord&logo=discord&label=&color=7289DA&logoColor=white&labelColor=&style=for-the-badge" height="35" alt="discord logo"/> </a>

@@ -33,68 +33,130 @@ WebRTCDecoder::WebRTCDecoder()
 }
 WebRTCDecoder::~WebRTCDecoder()
 {
-    //stopplay();
+    m_watchdog_stop = true;
+    if (m_watchdog.joinable())
+        m_watchdog.join();
 }
 WebRTCDecoder* WebRTCDecoder::GetInstance()
 {
     return g_pSingleton;
 }
+namespace {
+// a stream that has not delivered a frame for this long is treated as dead
+const long long kStaleFrameMs = 8000;
+
+long long now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+bool WebRTCDecoder::isStreamStale() const
+{
+    long long last = m_last_frame_ms.load();
+    return last != 0 && now_ms() - last > kStaleFrameMs;
+}
+
+void WebRTCDecoder::touchFrameTime()
+{
+    m_last_frame_ms = now_ms();
+}
+
 void WebRTCDecoder::stopPlay()
 {
+    std::lock_guard<std::mutex> guard(m_control_mutex);
+    m_play_requested = false;
+    stopPlayLocked();
+}
+
+void WebRTCDecoder::stopPlayLocked()
+{
     m_isStop = true;
-    std::future_status status = m_playFutrue.wait_for(std::chrono::seconds(2));
-    if (status == std::future_status::ready)
-	{
-		//cout << "线程执行完" << endl;
-	}	
+    // the receive thread checks m_isStop every 2ms and no longer holds frame_mutex_
+    // while blocking, so waiting for it to finish is safe and keeps the player state clean
+    if (m_playFutrue.valid())
+        m_playFutrue.wait();
+
     if (m_player) m_player->stopPlay();
 
+    m_status = STOPPED;
+    m_last_frame_ms = 0;
+    {
+        std::lock_guard<std::mutex> guard(this->frame_mutex_);
+        m_frame_data.clear();
+    }
 }
 
 void WebRTCDecoder::startPlay(const std::string& strUrl)
 {
-    std::lock_guard<std::mutex> guard(this->frame_mutex_); 
-    int waitCount = 100;
-    while(m_status == CONNECTTING)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        waitCount--;
-        if(waitCount<=0)
-        {
-            break;
-        }
-        }
-    
-    if(m_status == CONNECTED&& strUrl==m_url)
-        return;
-    std::cout << "connected!"<<m_status<<":"<<strUrl<<":"<<m_url<<"\r\n";
-    
-    if(m_status == CONNECTED)
-    {
-        this->stopPlay();
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    }
-    m_status = CONNECTTING;
-    m_url = strUrl;
-    m_isStop = false;
-    //m_recevie_frame_callback = recevie_frame;
-    //QString url = "http://172.23.208.238:8000/call/demo";
-    m_context->synMgr.session->playBuffer->resetVideoClock(m_context->synMgr.session->playBuffer->session);
-    int32_t err = m_player->playRtc(0, const_cast<char*>(m_url.c_str()));
-    std::cout << "connected!"<<err<<"\r\n";
-    if (!err)
-    {
-        m_playFutrue = std::async(std::launch::async, [this](){
-            while(!this->m_isStop)
-            {
-                this->receiveFrame();
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
+    std::lock_guard<std::mutex> guard(m_control_mutex);
+    m_play_requested = true;
+    startPlayLocked(strUrl);
 
-        });
+    if (!m_watchdog.joinable()) {
+        m_watchdog_stop = false;
+        m_watchdog = std::thread([this]() { this->watchdogLoop(); });
     }
 }
 
+void WebRTCDecoder::startPlayLocked(const std::string& strUrl)
+{
+    // an existing session on the same url is only reused while it still delivers frames,
+    // otherwise a reload of the video page would silently keep the dead connection
+    if (m_status == CONNECTED && strUrl == m_url && !isStreamStale())
+        return;
+
+    if (m_status != STOPPED || m_playFutrue.valid())
+        stopPlayLocked();
+
+    std::cout << "start webrtc play: " << strUrl << "\r\n";
+    m_status = CONNECTTING;
+    m_url = strUrl;
+    m_isStop = false;
+    // give the handshake the full stale timeout before the watchdog may retry
+    touchFrameTime();
+
+    m_context->synMgr.session->playBuffer->resetVideoClock(m_context->synMgr.session->playBuffer->session);
+    int32_t err = m_player->playRtc(0, const_cast<char*>(m_url.c_str()));
+    if (err)
+    {
+        std::cout << "webrtc playRtc failed: " << err << "\r\n";
+        m_status = STOPPED;
+        m_last_frame_ms = 0;
+        return;
+    }
+
+    m_playFutrue = std::async(std::launch::async, [this](){
+        while(!this->m_isStop)
+        {
+            this->receiveFrame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+}
+
+void WebRTCDecoder::watchdogLoop()
+{
+    while (!m_watchdog_stop)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (m_watchdog_stop)
+            break;
+
+        std::unique_lock<std::mutex> guard(m_control_mutex, std::try_to_lock);
+        if (!guard.owns_lock())
+            continue;
+        // covers both a silent stall and a connection the library already reported as failed
+        if (!m_play_requested || m_url.empty() || !isStreamStale())
+            continue;
+
+        std::cout << "webrtc stream stalled, reconnecting: " << m_url << "\r\n";
+        const std::string url = m_url;
+        stopPlayLocked();
+        startPlayLocked(url);
+    }
+}
 
 int WebRTCDecoder::width() 
 {
@@ -192,56 +254,54 @@ free(buffer);
 
 return true;
 }
-std::vector<unsigned char>& WebRTCDecoder::getFrameData()
+std::vector<unsigned char> WebRTCDecoder::getFrameData()
 {
-    
+    std::lock_guard<std::mutex> guard(this->frame_mutex_);
     if(m_status!=CONNECTED)
-            return m_frame_data;
-    std::lock_guard<std::mutex> guard(this->frame_mutex_); 
+        return std::vector<unsigned char>();
     return m_frame_data;
 }
 void WebRTCDecoder::receiveFrame(){
-     //uint8_t* t_vb = m_context->synMgr.session->playBuffer->getVideoRef(m_context->synMgr.session->playBuffer->session, &m_frame);
     YangVideoBuffer*  vb = m_player->getVideoBuffer();
     if(vb == nullptr)
         return;
     uint8_t* t_vb = vb->getVideoRef(&m_frame);
-    //std::cout << "receive"<< "\r\n";
-    if (t_vb)
+    if (!t_vb)
+        return;
+
+    const int width  = vb->m_width;
+    const int height = vb->m_height;
+    if(width <= 0 || height <= 0)
+        return;
+
+    m_width  = width;
+    m_height = height;
+
+    std::vector<unsigned char> rgbData(width * height * 3);
+    std::vector<unsigned char> yuvData(width * height * 3 / 2);
+    std::copy(t_vb, t_vb + yuvData.size(), yuvData.begin());
+    YUV420P_to_RGB24(yuvData.data(), rgbData.data(), width, height);
+
+    std::vector<unsigned char> frame_data;
+    const int quality = 90;
+    if (!rgb_to_jpeg(rgbData.data(), width, height, quality, frame_data))
+        return;
+
     {
-        this->frame_mutex_.lock();
-        std::vector<unsigned char> frame_data;
-        m_width = vb->m_width;//sync_buffer->width(sync_buffer->session);
-        m_height = vb->m_height;//sync_buffer->height(sync_buffer->session);
-        
-        if(m_width<=0)
-        {
-            return;
-        }
-        std::vector<unsigned char> rgbData(m_width * m_height * 3); 
-        std::vector<unsigned char> yuvData(m_width * m_height*3/2); 
-        std::copy(t_vb,t_vb+yuvData.size(),yuvData.begin());
-        //memncpy((void *)yuvData.data(),(void *)t_vb,yuvData.size());
-        YUV420P_to_RGB24(yuvData.data(), rgbData.data(), m_width, m_height);
-        int quality = 90;  // JPEG 质量
-    
-        if (rgb_to_jpeg(rgbData.data(), m_width, m_height, quality, frame_data)) {
-            
-            m_frame_data = frame_data;
-            
-        }
-        this->frame_mutex_.unlock();
-        
+        std::lock_guard<std::mutex> guard(this->frame_mutex_);
+        m_frame_data.swap(frame_data);
     }
-    
+    touchFrameTime();
 }
 void WebRTCDecoder::success()
 {
     m_status = CONNECTED;
-    
+    touchFrameTime();
 }
 void WebRTCDecoder::failure(int32_t errcode)
 {
+    std::cout << "webrtc connect failure: " << errcode << "\r\n";
+    // m_last_frame_ms is kept so the watchdog retries once the stale timeout has passed
     m_status = STOPPED;
     //emit RtcConnectFailure(errcode);
 }
